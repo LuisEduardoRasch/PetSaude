@@ -23,8 +23,19 @@ for filename in os.listdir(input_folder):
 all_data.to_csv(output_file, index=False)
 print("Arquivos CSV unidos com sucesso em", output_file)
 
-#Remover linhas duplicadas
-df = pd.read_csv('/home/viera/Área de trabalho/PetSaude/Altas_Secretaria_De_Saude.csv')
-df = df.drop_duplicates()
-df.to_csv('/home/viera/Área de trabalho/PetSaude/Altas_Secretaria_De_Saude.csv', index=False)
-print("Linhas duplicadas removidas com sucesso.")
+#Remover linhas duplicadas removendo linhas caso a o nome e a data sejam iguais
+
+df = pd.read_csv(output_file)
+df.drop_duplicates(subset=['Pacientes', 'Dia Alta'], keep='first', inplace=True)
+df.to_csv(output_file, index=False)
+print("Linhas duplicadas removidas com sucesso de", output_file)
+
+#separar em arquivos csv por encaminhado
+df = pd.read_csv(output_file)
+encaminhados = df['Encaminhado'].unique()
+for encaminhado in encaminhados:
+    df_encaminhado = df[df['Encaminhado'] == encaminhado]
+    df_encaminhado.to_csv(f'/home/viera/Área de trabalho/PetSaude/Encaminhados_{encaminhado}.csv', index=False)
+    print(f"Arquivo CSV criado para encaminhado {encaminhado}")
+
+print("Processamento concluído.")
