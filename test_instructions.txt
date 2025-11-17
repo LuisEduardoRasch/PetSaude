@@ -1,0 +1,17 @@
+Validação rápida:
+
+1) Crie pastas de teste:
+   mkdir test_input; mkdir test_output
+
+2) Coloque alguns arquivos .ods ou .csv em test_input (ex.: amostra.ods)
+
+3) No PowerShell:
+   python -m venv .venv; .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+
+4) Rode:
+   python convert_merge_split.py -i .\test_input -o .\test_output
+
+Verifique:
+- test_output/merged_deduped.csv
+- test_output/by_encaminhado/*.csv

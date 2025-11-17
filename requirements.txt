@@ -1,0 +1,4 @@
+pandas>=1.0
+ezodf>=0.3.2
+openpyxl
+lxml>=4.6.0
