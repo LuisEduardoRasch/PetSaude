@@ -1,22 +1,40 @@
-#!/usr/bin/env python3
-"""
-Converte todos arquivos .ods para .csv, junta todos os csv em um único csv,
-remove duplicados onde nome e data são iguais, e separa em arquivos por valor
-na coluna 'encaminhado'.
+"""Ferramentas para conversão e consolidação de altas em CSV.
 
-Uso: python convert_merge_split.py --input-dir <pasta> --output-dir <pasta_destino>
+Este módulo converte todos os arquivos ``.ods`` encontrados em uma pasta para
+arquivos ``.csv``, concatena todos os CSVs em um único conjunto de dados,
+remove duplicados com base em nome e data de alta e realiza uma separação
+especial pela coluna ``Tipo de Alta``.
 
-Observações:
-- Suporta arquivos .ods. Se um .ods tiver múltiplas planilhas, cada planilha
-  será salva como CSV separado com sufixo da aba.
-- Para remoção de duplicados, considera as colunas 'nome' e 'data' (case-insensitive).
-- Para separar por encaminhado, considera a coluna 'encaminhado' (case-insensitive).
+Fluxo principal (``main``)
+--------------------------
+- Converte arquivos ``.ods`` em CSVs temporários.
+- Lê todos os CSVs (temporários + existentes) e concatena em um único
+    :class:`pandas.DataFrame`.
+- Remove registros duplicados usando, quando possível, as colunas
+    "Pacientes"/"Nome" e "Dia Alta"/"Data" (comparação case-insensitive).
+- Separa, em um CSV à parte, os registros cujo ``Tipo de Alta`` não seja
+    "Melhorado" nem "Melhorada" (ignorando maiúsculas/minúsculas).
+- Remove, do CSV principal consolidado, as colunas ``Tipo de Alta``,
+    ``Telefone`` e ``Dia Alta``.
+ - Efetua uma limpeza geral (remoção de linhas vazias e sem paciente) e grava
+        o resultado final em ``merged_principal.xlsx`` e as altas não
+        "Melhorado/Melhorada" em ``altas_nao_melhorado.xlsx``.
+
+Uso
+---
+        python convert_merge_split.py --input-dir <pasta> --output-dir <pasta_destino>
+
+As opções são todas opcionais; na ausência de parâmetros, o script utiliza a
+pasta ``Arquivos`` como entrada e ``output`` como pasta de saída.
 """
 import argparse
 import csv
 import os
 import sys
 from pathlib import Path
+import unicodedata
+import re
+from openpyxl.utils import get_column_letter
 
 try:
     import ezodf
@@ -27,7 +45,6 @@ try:
     import pandas as pd
 except Exception:
     pd = None
-
 
 def ensure_dependencies():
     missing = []
@@ -40,10 +57,27 @@ def ensure_dependencies():
         print('Instale com: pip install -r requirements.txt')
         sys.exit(1)
 
+    # Ajuste defensivo: algumas versões do ezodf não possuem a chave
+    # '.ods' no mapa interno de MIME types, o que causa KeyError.
+    try:
+        import ezodf.document as _ezdoc  # type: ignore[import]
+
+        mts = getattr(_ezdoc, 'MIMETYPES', None)
+        if isinstance(mts, dict):
+            # Se existir a chave 'ods' mas não '.ods', cria um alias.
+            if 'ods' in mts and '.ods' not in mts:
+                mts['.ods'] = mts['ods']
+            if 'ods' in mts and '.ODS' not in mts:
+                mts['.ODS'] = mts['ods']
+    except Exception:
+        # Se o patch falhar por qualquer motivo, seguimos usando o padrão.
+        pass
+
 
 def ods_to_csv(ods_path: Path, out_dir: Path):
     """Converte um arquivo .ods para um ou mais CSVs (uma por planilha)."""
-    doc = ezodf.opendoc(ods_path)
+    # Garante que o caminho seja passado como string para o ezodf.
+    doc = ezodf.opendoc(str(ods_path))
     created = []
     for sheet in doc.sheets:
         if sheet.nrows() == 0:
@@ -68,11 +102,6 @@ def ods_to_csv(ods_path: Path, out_dir: Path):
                 header_row = r
                 data_start_row = r + 1
                 break
-        
-        if header_row is None:
-            # Se não encontrou cabeçalho, assume linha 0
-            header_row = 0
-            data_start_row = 1
         
         # Extrai dados
         all_rows = []
@@ -144,9 +173,18 @@ def process_data_row(row):
     
     # Detecta padrão onde o segundo nome está na coluna "Tipo de Alta"
     # Isso acontece quando há dois pacientes em uma linha
-    if (len(row) >= 2 and 
-        row[1].strip() and 
-        not row[1].strip().upper() in ['MELHORADA', 'ALTA', 'OBITO', 'TRANSFERENCIA', 'ABANDONO']):
+    if (
+        len(row) >= 2
+        and row[1].strip()
+        and row[1].strip().upper() not in [
+            'MELHORADA',
+            'MELHORADO',
+            'ALTA',
+            'OBITO',
+            'TRANSFERENCIA',
+            'ABANDONO',
+        ]
+    ):
         
         # O segundo campo parece ser um nome, não um tipo de alta
         second_name = row[1].strip()
@@ -224,72 +262,116 @@ def find_files(input_dir: Path):
 
 
 def concat_csvs(csv_paths, out_path: Path):
-    # Use pandas for robust concatenation and dedup
+    """Concatena múltiplos arquivos CSV em um único :class:`pandas.DataFrame`.
+
+    A função procura normalizar nomes de colunas vindos de fontes diversas
+    para um conjunto padrão ("Pacientes", "Tipo de Alta", "Telefone",
+    "Dia Alta", "Cid", "Endereço", "Encaminhado"), limpa espaços em
+    branco, corrige alguns casos comuns de desalinhamento de dados e remove
+    linhas sem nome de paciente.
+
+    Parameters
+    ----------
+    csv_paths : iterable of pathlib.Path
+        Caminhos dos arquivos CSV a serem concatenados.
+    out_path : pathlib.Path
+        Caminho de saída utilizado apenas se nenhum DataFrame válido for
+        gerado; nesse caso, um arquivo vazio é criado nesse local.
+
+    Returns
+    -------
+    pandas.DataFrame or pathlib.Path
+        DataFrame concatenado com todas as linhas válidas ou, se nenhum
+        CSV válido for encontrado, o próprio ``out_path``.
+    """
     dfs = []
-    expected_columns = ['Pacientes', 'Tipo de Alta', 'Telefone', 'Dia Alta', 'Cid', 'Endereço', 'Encaminhado']
-    
+
     for p in csv_paths:
         try:
             df = pd.read_csv(p, dtype=str)
-            
-            # Skip empty dataframes
             if df.empty:
                 continue
-            
-            # Clean column names
+
+            # Limpa nomes de colunas e tenta mapeá-los para o padrão interno
             df.columns = [str(c).strip() for c in df.columns]
-            
-            # Remove completely empty rows
-            df = df.dropna(how='all')
-            
-            # Try to standardize columns
-            if len(df.columns) >= len(expected_columns):
-                # Use the first N columns and rename them
-                df = df.iloc[:, :len(expected_columns)]
-                df.columns = expected_columns
-            else:
-                # Add missing columns
-                for col in expected_columns:
-                    if col not in df.columns:
-                        df[col] = ''
-                df = df[expected_columns]  # Reorder columns
-            
-            # Clean data
+
+            col_map = {}
+
+            col = find_column(df, ['pacientes', 'nome'])
+            if col and col != 'Pacientes':
+                col_map[col] = 'Pacientes'
+
+            col = find_column(df, ['tipo de alta', 'tipo_alta'])
+            if col and col != 'Tipo de Alta':
+                col_map[col] = 'Tipo de Alta'
+
+            col = find_column(df, ['telefone', 'fone'])
+            if col and col != 'Telefone':
+                col_map[col] = 'Telefone'
+
+            col = find_column(df, ['dia alta', 'data', 'dia de alta'])
+            if col and col != 'Dia Alta':
+                col_map[col] = 'Dia Alta'
+
+            col = find_column(df, ['cid'])
+            if col and col != 'Cid':
+                col_map[col] = 'Cid'
+
+            col = find_column(df, ['endereço', 'endereco'])
+            if col and col != 'Endereço':
+                col_map[col] = 'Endereço'
+
+            col = find_column(df, ['encaminhado'])
+            if col and col != 'Encaminhado':
+                col_map[col] = 'Encaminhado'
+
+            if col_map:
+                df = df.rename(columns=col_map)
+
+            # Limpa dados: converte tudo para string e remove espaços
             for col in df.columns:
-                if col in df.columns:
-                    df[col] = df[col].fillna('').astype(str).str.strip()
-            
-            # Fix rows where Encaminhado is empty but Endereço looks like CAPS
-            # This happens when data is misaligned
-            for idx in df.index:
-                if (df.loc[idx, 'Encaminhado'] == '' and 
-                    df.loc[idx, 'Endereço'].upper().startswith(('CAPS', 'UBS', 'HOSPITAL'))):
-                    # Move the CAPS info from Endereço to Encaminhado
-                    df.loc[idx, 'Encaminhado'] = df.loc[idx, 'Endereço']
-                    df.loc[idx, 'Endereço'] = ''  # Clear the address since it was wrong
-            
-            # Remove rows where 'Pacientes' is empty (these are likely headers or junk)
-            df = df[df['Pacientes'].str.strip() != '']
-            
+                df[col] = df[col].fillna('').astype(str).str.strip()
+
+            # Corrige linhas em que Encaminhado está vazio e Endereço parece CAPS/UBS/HOSPITAL
+            enc_col = 'Encaminhado' if 'Encaminhado' in df.columns else find_column(df, ['encaminhado'])
+            end_col = 'Endereço' if 'Endereço' in df.columns else find_column(df, ['endereço', 'endereco'])
+
+            if enc_col and end_col:
+                for idx in df.index:
+                    end_val = str(df.loc[idx, end_col]).upper()
+                    if df.loc[idx, enc_col] == '' and end_val.startswith(('CAPS', 'UBS', 'HOSPITAL')):
+                        df.loc[idx, enc_col] = df.loc[idx, end_col]
+                        df.loc[idx, end_col] = ''
+
+            # Remove linhas sem paciente (prováveis cabeçalhos/junk)
+            pac_col = 'Pacientes' if 'Pacientes' in df.columns else find_column(df, ['pacientes', 'nome'])
+            if pac_col:
+                df = df[df[pac_col].fillna('').astype(str).str.strip() != '']
+
+            # Remove linhas completamente vazias
+            df = df.dropna(how='all')
+
             if not df.empty:
                 dfs.append(df)
                 print(f'Processado {p}: {len(df)} linhas válidas')
-            
+
         except Exception as e:
             print(f'Erro lendo {p}: {e}')
-    
+
     if not dfs:
-        # create empty file
+        # Cria arquivo vazio se nada foi lido
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text('')
         return out_path
-    
+
     big = pd.concat(dfs, ignore_index=True, sort=False)
-    
-    # Final cleanup
-    big = big.dropna(how='all')  # Remove empty rows
-    big = big[big['Pacientes'].str.strip() != '']  # Remove rows without patient names
-    
+
+    # Limpeza final global
+    big = big.dropna(how='all')
+    if 'Pacientes' in big.columns:
+        big['Pacientes'] = big['Pacientes'].fillna('').astype(str)
+        big = big[big['Pacientes'].str.strip() != '']
+
     return big
 
 
@@ -308,21 +390,194 @@ def find_column(df, candidates):
     return None
 
 
-def remove_duplicates(df):
-    """Remove duplicates using best-effort column matching.
+def _normalize_cell_for_empty(value):
+    """Normaliza um valor de célula para detecção de vazio.
 
-    Tries ('pacientes' or 'nome') and ('dia alta' or 'data'). If not found,
-    falls back to removing full-row duplicates.
+    Converte para string, remove espaços e aspas nas pontas e considera
+    como vazio também valores compostos apenas por vírgulas (por exemplo
+    ",,,"), que surgem de linhas com apenas separadores no CSV original.
+    """
+    if value is None:
+        s = ''
+    else:
+        s = str(value)
+
+    s = s.strip().strip('"').strip("'")
+
+    if not s:
+        return ''
+
+    # Se após limpeza o valor é apenas um monte de vírgulas, trata como vazio
+    if all(ch == ',' for ch in s):
+        return ''
+
+    return s
+
+def _normalize_text_key(value):
+    """Normaliza texto para comparação de duplicatas.
+
+    - Converte para string.
+    - Remove espaços extras nas pontas.
+    - Remove acentos (ex.: 'Á', 'ã', 'Ç' -> 'A', 'A', 'C').
+    - Converte "ç"/"Ç" em "c"/"C".
+    - Colapsa múltiplos espaços internos em um único espaço.
+    - Converte para maiúsculas.
+
+    Retorna string vazia para valores nulos ou em branco após limpeza.
+    """
+    if value is None:
+        return ''
+
+    s = str(value)
+
+    # Normaliza espaços (inclui espaços não separáveis)
+    s = s.replace('\u00A0', ' ')
+    s = s.strip()
+    if not s:
+        return ''
+
+    # Remove acentos usando decomposição Unicode
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+
+    # Garantia extra para ç/Ç (apesar de já coberto acima)
+    s = s.replace('ç', 'c').replace('Ç', 'C')
+
+    # Colapsa múltiplos espaços internos
+    s = re.sub(r'\s+', ' ', s)
+
+    # Normaliza para maiúsculas
+    s = s.upper()
+
+    return s
+
+
+def remove_duplicates(df):
+    """Remove duplicatas de pacientes utilizando nome + endereço (preferencialmente).
+
+    A deduplicação segue a seguinte prioridade:
+
+    1. Se existirem colunas que representem nome do paciente e endereço,
+       remove duplicatas por (nome_normalizado, endereco_normalizado).
+    2. Caso não exista coluna de endereço, tenta remover duplicatas por
+       (nome_normalizado, data_normalizada), usando as colunas de dia de alta/data.
+    3. Se nada disso estiver disponível, remove duplicatas considerando
+       a linha completa.
+
+    A normalização converte valores para uma forma canônica, removendo
+    acentos, transformando "ç" em "c", colapsando espaços duplos e
+    aplicando maiúsculas, para evitar que pequenas variações de escrita
+    permitam que duplicatas passem.
     """
     name_col = find_column(df, ['pacientes', 'nome'])
+    addr_col = find_column(df, ['endereço', 'endereco'])
     date_col = find_column(df, ['dia alta', 'data'])
-    if name_col and date_col:
-        print(f'Removendo duplicados por colunas: {name_col}, {date_col}')
-        deduped = df.drop_duplicates(subset=[name_col, date_col])
-        return deduped
-    else:
-        print('Colunas identificadoras (Pacientes/Dia Alta ou Nome/Data) não encontradas; removendo duplicados completos')
+
+    # Nenhuma coluna de nome encontrada: cai para duplicata de linha inteira
+    if not name_col:
+        print('Coluna de nome de paciente não encontrada; removendo duplicados completos.')
         return df.drop_duplicates()
+
+    # Cria colunas normalizadas auxiliares (não são gravadas no resultado final)
+    df = df.copy()
+
+    df['_NORM_NAME'] = df[name_col].apply(_normalize_text_key)
+
+    if addr_col:
+        df['_NORM_ADDR'] = df[addr_col].apply(_normalize_text_key)
+
+    if date_col:
+        df['_NORM_DATE'] = df[date_col].apply(_normalize_text_key)
+
+    # 1) Tenta nome + endereço
+    if addr_col:
+        print(f'Removendo duplicados por colunas: {name_col} + {addr_col} (normalizados)')
+        deduped = df.drop_duplicates(subset=['_NORM_NAME', '_NORM_ADDR'], keep='first')
+    # 2) Senão, tenta nome + data
+    elif date_col:
+        print(f'Removendo duplicados por colunas: {name_col} + {date_col} (normalizados)')
+        deduped = df.drop_duplicates(subset=['_NORM_NAME', '_NORM_DATE'], keep='first')
+    # 3) Fallback: linha inteira
+    else:
+        print('Sem endereço/data; removendo duplicados por linha completa.')
+        deduped = df.drop_duplicates(keep='first')
+
+    # Remove colunas auxiliares antes de devolver
+    for aux in ['_NORM_NAME', '_NORM_ADDR', '_NORM_DATE']:
+        if aux in deduped.columns:
+            deduped = deduped.drop(columns=[aux])
+
+    return deduped
+
+
+def split_by_tipo_alta(df, output_dir: Path):
+    """
+    Separa registros com tipo de alta diferente de 'Melhorado' ou 'Melhorada'.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame consolidado contendo ao menos a coluna 'Tipo de Alta'.
+    output_dir : pathlib.Path
+        Diretório onde o CSV com tipos de alta não padrão será salvo.
+
+    Returns
+    -------
+    main_df : pandas.DataFrame
+        DataFrame contendo apenas altas 'Melhorado'/'Melhorada' ou sem
+        informação de tipo de alta (coluna vazia).
+    other_file : pathlib.Path or None
+        Caminho do CSV gerado com tipos de alta não padrão, ou None
+        caso nenhum registro tenha sido separado.
+    """
+    tipo_col = find_column(df, ['tipo de alta'])
+    if tipo_col is None:
+        print('Coluna "Tipo de Alta" não encontrada; nenhum arquivo extra será gerado.')
+        return df, None
+
+    series = df[tipo_col].fillna('').astype(str).str.strip()
+    norm = series.str.lower()
+
+    # Registros considerados "não padrão":
+    # - tipo de alta não vazio
+    # - e diferente de "melhorado" ou "melhorada"
+    mask_other = (series != '') & ~norm.isin(['melhorado', 'melhorada'])
+
+    if not mask_other.any():
+        print('Nenhum registro com Tipo de Alta diferente de "Melhorado/Melhorada" encontrado.')
+        return df, None
+
+    other_df = df[mask_other].copy()
+    main_df = df[~mask_other].copy()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    other_file = output_dir / 'altas_nao_melhorado.xlsx'
+
+    # Grava arquivo de altas não "Melhorado/Melhorada" com ajuste básico de colunas
+    with pd.ExcelWriter(other_file, engine='openpyxl') as writer:
+        other_df.to_excel(writer, index=False, sheet_name='Altas')
+        ws = writer.sheets['Altas']
+
+        # Autoajuste simples de largura das colunas com base no conteúdo
+        for col_idx, col_name in enumerate(other_df.columns, start=1):
+            col_len = max(
+                other_df[col_name].astype(str).map(len).max() if not other_df.empty else 0,
+                len(col_name),
+            )
+            col_letter = get_column_letter(col_idx)
+            # Largura em unidades de caractere aproximada
+            ws.column_dimensions[col_letter].width = min(col_len + 2, 80)
+
+        # Exemplos (comente/descomente para ajustes específicos):
+        # ws.column_dimensions['A'].width = 40   # primeira coluna mais larga
+        # ws.row_dimensions[1].height = 18      # cabeçalho mais alto (em pontos aprox.)
+
+    print(
+        f'Registros com Tipo de Alta diferente de "Melhorado/Melhorada" '
+        f'salvos em: {other_file} ({len(other_df)} linhas)'
+    )
+
+    return main_df, other_file
 
 
 def split_by_encaminhado(df, output_dir: Path):
@@ -370,19 +625,47 @@ def split_by_encaminhado(df, output_dir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Converter .ods→.csv, concatenar, deduplicar e dividir por encaminhado')
-    parser.add_argument('--input-dir', '-i', default=None, help='Pasta com arquivos .ods/.csv (padrão: ./Arquivos)')
-    parser.add_argument('--output-dir', '-o', default=None, help='Pasta de saída para arquivos resultantes (padrão: ./output)')
-    parser.add_argument('--temp-dir', '-t', default=None, help='Pasta temporária para CSVs convertidos (padrão: output-dir/temp_csvs)')
+    """
+    Executa o fluxo completo de processamento de arquivos ODS/CSV.
+
+    Etapas
+    ------
+    1. Localiza arquivos de entrada.
+    2. Converte arquivos ODS em CSV temporários.
+    3. Concatena todos os CSVs em um único DataFrame.
+    4. Remove registros duplicados.
+    5. Separa registros cujo 'Tipo de Alta' é diferente de
+       'Melhorado' ou 'Melhorada' em um CSV à parte.
+    6. Remove as colunas 'Tipo de Alta', 'Telefone' e 'Dia Alta'
+       do CSV principal.
+    7. Remove linhas vazias e grava o resultado final em disco.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            'Converter .ods→.csv, concatenar, deduplicar e separar por Tipo de Alta '
+            '(Melhorado/Melhorada vs demais).'
+        )
+    )
+    parser.add_argument(
+        '--input-dir', '-i', default=None,
+        help='Pasta com arquivos .ods/.csv (padrão: ./Arquivos)',
+    )
+    parser.add_argument(
+        '--output-dir', '-o', default=None,
+        help='Pasta de saída para arquivos resultantes (padrão: ./output)',
+    )
+    parser.add_argument(
+        '--temp-dir', '-t', default=None,
+        help='Pasta temporária para CSVs convertidos (padrão: output-dir/temp_csvs)',
+    )
     args = parser.parse_args()
 
-    # default directories: use 'Arquivos' (sibling folder) as input and 'output' as output
+    # Diretórios padrão: usa 'Arquivos' como entrada e 'output' como saída.
     script_dir = Path(__file__).resolve().parent
     input_dir = Path(args.input_dir).resolve() if args.input_dir else (script_dir / 'Arquivos').resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else (script_dir / 'output').resolve()
     temp_dir = Path(args.temp_dir).resolve() if args.temp_dir else output_dir / 'temp_csvs'
 
-    # Inform the user if defaults were used
     if args.input_dir is None:
         print(f'Nenhum --input-dir informado; usando padrão: {input_dir}')
     if args.output_dir is None:
@@ -395,48 +678,93 @@ def main():
 
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # convert ods
+    # 1) Converte ODS para CSV temporários
     for ods in ods_files:
         created = ods_to_csv(ods, temp_dir)
         print(f'Convertido {ods} -> {len(created)} CSV(s)')
 
-    # collect csvs from temp_dir and input_dir
+    # 2) Coleta todos os CSVs (temporários + já existentes)
     all_csvs = list(temp_dir.rglob('*.csv')) + csv_files
     print(f'Total CSVs para concatenar: {len(all_csvs)}')
 
-    # concat
+    # 3) Concatena todos os CSVs em um único DataFrame
     big = concat_csvs(all_csvs, output_dir / 'merged.csv')
     if isinstance(big, Path):
         print('Nenhum CSV válido para concatenar; saindo')
         return
 
-    # remove duplicates
+    # 4) Remove duplicados
     deduped = remove_duplicates(big)
 
-    # write merged deduped
-    merged_out = output_dir / 'merged_deduped.csv'
+    # 5) Separa registros por Tipo de Alta
+    deduped, other_file = split_by_tipo_alta(deduped, output_dir)
+
+    # 6) Remove colunas não desejadas do CSV principal
+    cols_to_drop = [col for col in ['Tipo de Alta', 'Telefone', 'Dia Alta'] if col in deduped.columns]
+    if cols_to_drop:
+        print(f'Removendo colunas do CSV principal: {", ".join(cols_to_drop)}')
+        deduped = deduped.drop(columns=cols_to_drop)
+
+    # 7) Limpeza final: remove linhas vazias ou apenas com vírgulas/aspas
+    # Cria uma cópia normalizada para avaliar quais linhas têm conteúdo real.
+    cleaned = deduped.copy()
+    for col in cleaned.columns:
+        cleaned[col] = cleaned[col].map(_normalize_cell_for_empty)
+
+    # Remove linhas em que todas as colunas ficam vazias após normalização
+    mask_any_value = (cleaned != '').any(axis=1)
+    deduped = deduped[mask_any_value]
+    cleaned = cleaned[mask_any_value]
+
+    # Remove linhas em que a coluna de paciente está vazia (ou só vírgulas/aspas)
+    if 'Pacientes' in cleaned.columns:
+        mask_paciente = cleaned['Pacientes'] != ''
+        deduped = deduped[mask_paciente]
+        cleaned = cleaned[mask_paciente]
+
+        # 8) Deduplicação FINAL: mesmo paciente + mesmo endereço (normalizados)
+    if 'Pacientes' in cleaned.columns and 'Endereço' in cleaned.columns:
+        norm_name = cleaned['Pacientes'].map(_normalize_text_key)
+        norm_addr = cleaned['Endereço'].map(_normalize_text_key)
+
+        mask_with_addr = (norm_name != '') & (norm_addr != '')
+        idx_with_addr = cleaned.index[mask_with_addr]
+
+        if len(idx_with_addr) > 0:
+            keys = norm_name[mask_with_addr] + '|' + norm_addr[mask_with_addr]
+            duplicated = keys.duplicated(keep='first')
+            drop_idx = idx_with_addr[duplicated]
+            if len(drop_idx) > 0:
+                print(f'Removendo duplicatas finais por Pacientes+Endereço: {len(drop_idx)} linhas')
+                deduped = deduped.drop(index=drop_idx)
+
+    # Reorganiza o índice antes de salvar
+    deduped = deduped.reset_index(drop=True)
+
+    # Grava arquivo principal final em formato Excel (.xlsx) com ajuste básico de colunas
     output_dir.mkdir(parents=True, exist_ok=True)
-    deduped.to_csv(merged_out, index=False)
-    print(f'Merged deduped escrito em: {merged_out}')
+    merged_out = output_dir / 'merged_principal.xlsx'
 
-    # split by encaminhado
-    split_files = split_by_encaminhado(deduped, output_dir / 'by_encaminhado')
-    print(f'Arquivos separados por encaminhado: {len(split_files)}')
-    
-    # Create clean version without problematic rows
-    create_clean_encaminhado_files(output_dir / 'by_encaminhado', output_dir / 'by_encaminhado_clean')
-    
-    # Remove original by_encaminhado folder after creating clean version
-    import shutil
-    original_folder = output_dir / 'by_encaminhado'
-    if original_folder.exists():
-        shutil.rmtree(original_folder)
-        print(f'Pasta original removida: {original_folder}')
-        print(f'Use a pasta limpa: {output_dir / "by_encaminhado_clean"}')
-    
-    # Generate patient count report
-    generate_patient_count_report(output_dir / 'by_encaminhado_clean', output_dir / 'relatorio_pacientes_por_caps.txt')
+    with pd.ExcelWriter(merged_out, engine='openpyxl') as writer:
+        deduped.to_excel(writer, index=False, sheet_name='Altas')
+        ws = writer.sheets['Altas']
 
+        # Autoajuste simples de largura das colunas com base no conteúdo
+        for col_idx, col_name in enumerate(deduped.columns, start=1):
+            col_len = max(
+                deduped[col_name].astype(str).map(len).max() if not deduped.empty else 0,
+                len(col_name),
+            )
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = min(col_len + 2, 80)
+
+        # Exemplos opcionais de ajuste fino:
+        # ws.column_dimensions['A'].width = 40   # "Pacientes" mais larga
+        # ws.row_dimensions[1].height = 18      # cabeçalho mais alto
+
+    print(f'Arquivo principal escrito em: {merged_out}')
+    if other_file is not None:
+        print(f'CSV com tipos de alta não "Melhorado/Melhorada": {other_file}')
 
 def generate_patient_count_report(clean_dir: Path, report_file: Path):
     """Gera relatório com quantidade de pacientes por arquivo CAPS."""
