@@ -22,35 +22,98 @@ def run_processing(input_dir: str, output_dir: str, button: tk.Button) -> None:
     try:
         button.config(state=tk.DISABLED)
 
-        script_dir = Path(__file__).resolve().parent
-        script_path = script_dir / "convert_merge_split.py"
+        # Normaliza e valida pastas informadas pelo usuário
+        input_dir = input_dir.strip()
+        output_dir = output_dir.strip()
 
-        if not script_path.exists():
+        if not input_dir or not output_dir:
             messagebox.showerror(
                 "Erro",
-                f"Arquivo convert_merge_split.py não encontrado em:\n{script_path}",
+                "Informe as pastas de ENTRADA e SAÍDA antes de iniciar o processamento.",
             )
             return
 
-        cmd = [
-            sys.executable,
-            str(script_path),
-            "--input-dir",
-            input_dir,
-            "--output-dir",
-            output_dir,
-        ]
+        input_path = Path(input_dir)
+        output_path = Path(output_dir)
 
-        # NÃO captura stdout/stderr -> logs aparecem no terminal
-        result = subprocess.run(cmd)
+        if not input_path.is_dir():
+            messagebox.showerror(
+                "Erro",
+                f"Pasta de entrada não encontrada:\n{input_path}",
+            )
+            return
 
-        if result.returncode == 0:
+        if not output_path.exists():
+            # Cria pasta de saída se não existir
+            try:
+                output_path.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(
+                    "Erro",
+                    f"Não foi possível criar a pasta de saída:\n{output_path}\n{exc}",
+                )
+                return
+
+        # Quando empacotado pelo PyInstaller, chamamos o módulo diretamente.
+        if getattr(sys, "frozen", False):
+            try:
+                import convert_merge_split as cms  # type: ignore[import]
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(
+                    "Erro",
+                    f"Não foi possível carregar o módulo de processamento:\n{exc}",
+                )
+                return
+
+            # Simula chamada via linha de comando para reutilizar o argparse do script.
+            old_argv = sys.argv
+            sys.argv = [
+                "convert_merge_split",
+                "--input-dir",
+                str(input_path),
+                "--output-dir",
+                str(output_path),
+            ]
+            try:
+                try:
+                    cms.main()  # type: ignore[attr-defined]
+                    return_code = 0
+                except SystemExit as exc:  # argparse pode chamar sys.exit()
+                    return_code = int(exc.code) if isinstance(exc.code, int) else 1
+            finally:
+                sys.argv = old_argv
+        else:
+            # Modo desenvolvimento: chama o script via python no terminal.
+            script_dir = Path(__file__).resolve().parent
+            script_path = script_dir / "convert_merge_split.py"
+
+            if not script_path.exists():
+                messagebox.showerror(
+                    "Erro",
+                    f"Arquivo convert_merge_split.py não encontrado em:\n{script_path}",
+                )
+                return
+
+            cmd = [
+                sys.executable,
+                str(script_path),
+                "--input-dir",
+                str(input_path),
+                "--output-dir",
+                str(output_path),
+            ]
+
+            # NÃO captura stdout/stderr -> logs aparecem no terminal
+            result = subprocess.run(cmd)
+            return_code = result.returncode
+
+        if return_code == 0:
             messagebox.showinfo("Concluído", "Processamento concluído com sucesso.")
         else:
             messagebox.showerror(
                 "Erro",
-                f"Erro no processamento (código {result.returncode}). "
-                "Veja os detalhes no terminal.",
+                f"Erro no processamento (código {return_code}). "
+                "Veja os detalhes no terminal (modo desenvolvimento).",
             )
 
     except Exception as exc:  # noqa: BLE001
@@ -90,9 +153,6 @@ def main() -> None:
    )
    entry_input = tk.Entry(frame_params, width=50)
    entry_input.grid(row=0, column=1, padx=5, pady=2)
-   entry_input.insert(
-       0, str((Path(__file__).resolve().parent / " ").resolve())
-   )
    btn_input = tk.Button(
        frame_params,
        text="Selecionar...",
@@ -106,9 +166,6 @@ def main() -> None:
    )
    entry_output = tk.Entry(frame_params, width=50)
    entry_output.grid(row=1, column=1, padx=5, pady=(5, 2))
-   entry_output.insert(
-       0, str((Path(__file__).resolve().parent / " ").resolve())
-   )
    btn_output = tk.Button(
        frame_params,
        text="Selecionar...",

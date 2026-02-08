@@ -1,0 +1,11 @@
+{
+  "input_dir": "Arquivos",
+  "output_dir": "output",
+  "temp_dir": null,
+  "log_level": "INFO",
+  "required_columns": {
+    "Pacientes": ["Pacientes", "Paciente", "Nome do Paciente"],
+    "Tipo de Alta": ["Tipo de Alta", "Alta"],
+    "Encaminhado": ["Encaminhado", "Encaminhamento"]
+  }
+}

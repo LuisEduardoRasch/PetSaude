@@ -29,12 +29,19 @@ pasta ``Arquivos`` como entrada e ``output`` como pasta de saída.
 """
 import argparse
 import csv
+import json
+import logging
 import os
-import sys
-from pathlib import Path
-import unicodedata
 import re
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Optional
 from openpyxl.utils import get_column_letter
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 try:
     import ezodf
@@ -45,6 +52,69 @@ try:
     import pandas as pd
 except Exception:
     pd = None
+
+from clean_csv import clean_dataframe
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_CONFIG = {
+    "input_dir": "Arquivos",
+    "output_dir": "output",
+    "temp_dir": None,
+    "log_level": "INFO",
+    "required_columns": {
+        "Pacientes": ["Pacientes", "Paciente", "Nome do Paciente"],
+        "Tipo de Alta": ["Tipo de Alta", "Alta"],
+        "Encaminhado": ["Encaminhado", "Encaminhamento"],
+    },
+}
+
+
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+
+def load_config(config_path: Optional[Path], script_dir: Path) -> dict:
+    config = DEFAULT_CONFIG.copy()
+    config["required_columns"] = DEFAULT_CONFIG["required_columns"].copy()
+
+    if config_path is None:
+        default_path = script_dir / "config.json"
+        if default_path.exists():
+            config_path = default_path
+
+    if config_path is not None and config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+
+        config.update({k: v for k, v in loaded.items() if k != "required_columns"})
+        if "required_columns" in loaded:
+            config["required_columns"].update(loaded["required_columns"])
+
+    return config
+
+
+def validate_schema(df, required_columns: dict, context: str) -> dict:
+    missing = []
+    resolved = {}
+
+    for logical_name, candidates in required_columns.items():
+        if not isinstance(candidates, list):
+            candidates = [candidates]
+
+        col = find_column(df, candidates)
+        if col is None:
+            missing.append(logical_name)
+        else:
+            resolved[logical_name] = col
+
+    if missing:
+        raise ValueError(f"Schema inválido em {context}. Faltando: {', '.join(missing)}")
+
+    return resolved
 
 def ensure_dependencies():
     missing = []
@@ -353,10 +423,10 @@ def concat_csvs(csv_paths, out_path: Path):
 
             if not df.empty:
                 dfs.append(df)
-                print(f'Processado {p}: {len(df)} linhas válidas')
+                logger.info('Processado %s: %s linhas válidas', p, len(df))
 
         except Exception as e:
-            print(f'Erro lendo {p}: {e}')
+            logger.warning('Erro lendo %s: %s', p, e)
 
     if not dfs:
         # Cria arquivo vazio se nada foi lido
@@ -475,7 +545,7 @@ def remove_duplicates(df):
 
     # Nenhuma coluna de nome encontrada: cai para duplicata de linha inteira
     if not name_col:
-        print('Coluna de nome de paciente não encontrada; removendo duplicados completos.')
+        logger.warning('Coluna de nome de paciente não encontrada; removendo duplicados completos.')
         return df.drop_duplicates()
 
     # Cria colunas normalizadas auxiliares (não são gravadas no resultado final)
@@ -491,15 +561,15 @@ def remove_duplicates(df):
 
     # 1) Tenta nome + endereço
     if addr_col:
-        print(f'Removendo duplicados por colunas: {name_col} + {addr_col} (normalizados)')
+        logger.info('Removendo duplicados por colunas: %s + %s (normalizados)', name_col, addr_col)
         deduped = df.drop_duplicates(subset=['_NORM_NAME', '_NORM_ADDR'], keep='first')
     # 2) Senão, tenta nome + data
     elif date_col:
-        print(f'Removendo duplicados por colunas: {name_col} + {date_col} (normalizados)')
+        logger.info('Removendo duplicados por colunas: %s + %s (normalizados)', name_col, date_col)
         deduped = df.drop_duplicates(subset=['_NORM_NAME', '_NORM_DATE'], keep='first')
     # 3) Fallback: linha inteira
     else:
-        print('Sem endereço/data; removendo duplicados por linha completa.')
+        logger.info('Sem endereço/data; removendo duplicados por linha completa.')
         deduped = df.drop_duplicates(keep='first')
 
     # Remove colunas auxiliares antes de devolver
@@ -532,7 +602,7 @@ def split_by_tipo_alta(df, output_dir: Path):
     """
     tipo_col = find_column(df, ['tipo de alta'])
     if tipo_col is None:
-        print('Coluna "Tipo de Alta" não encontrada; nenhum arquivo extra será gerado.')
+        logger.warning('Coluna "Tipo de Alta" não encontrada; nenhum arquivo extra será gerado.')
         return df, None
 
     series = df[tipo_col].fillna('').astype(str).str.strip()
@@ -544,7 +614,7 @@ def split_by_tipo_alta(df, output_dir: Path):
     mask_other = (series != '') & ~norm.isin(['melhorado', 'melhorada'])
 
     if not mask_other.any():
-        print('Nenhum registro com Tipo de Alta diferente de "Melhorado/Melhorada" encontrado.')
+        logger.info('Nenhum registro com Tipo de Alta diferente de "Melhorado/Melhorada" encontrado.')
         return df, None
 
     other_df = df[mask_other].copy()
@@ -572,9 +642,11 @@ def split_by_tipo_alta(df, output_dir: Path):
         # ws.column_dimensions['A'].width = 40   # primeira coluna mais larga
         # ws.row_dimensions[1].height = 18      # cabeçalho mais alto (em pontos aprox.)
 
-    print(
-        f'Registros com Tipo de Alta diferente de "Melhorado/Melhorada" '
-        f'salvos em: {other_file} ({len(other_df)} linhas)'
+    logger.info(
+        'Registros com Tipo de Alta diferente de "Melhorado/Melhorada" '
+        'salvos em: %s (%s linhas)',
+        other_file,
+        len(other_df),
     )
 
     return main_df, other_file
@@ -589,7 +661,7 @@ def split_by_encaminhado(df, output_dir: Path):
         out = output_dir / 'all_encaminhado_missing.csv'
         output_dir.mkdir(parents=True, exist_ok=True)
         df.to_csv(out, index=False)
-        print(f'Coluna encaminhado não encontrada. Arquivo escrito em: {out}')
+        logger.warning('Coluna encaminhado não encontrada. Arquivo escrito em: %s', out)
         return [out]
     
     # Make a copy to avoid the warning
@@ -619,7 +691,7 @@ def split_by_encaminhado(df, output_dir: Path):
         out = output_dir / fname
         group.to_csv(out, index=False)
         files.append(out)
-        print(f'Arquivo criado: {fname} com {len(group)} registros')
+        logger.info('Arquivo criado: %s com %s registros', fname, len(group))
     
     return files
 
@@ -658,40 +730,52 @@ def main():
         '--temp-dir', '-t', default=None,
         help='Pasta temporária para CSVs convertidos (padrão: output-dir/temp_csvs)',
     )
+    parser.add_argument(
+        '--config', '-c', default=None,
+        help='Arquivo de configuração JSON (padrão: ./config.json)',
+    )
     args = parser.parse_args()
 
     # Diretórios padrão: usa 'Arquivos' como entrada e 'output' como saída.
     script_dir = Path(__file__).resolve().parent
-    input_dir = Path(args.input_dir).resolve() if args.input_dir else (script_dir / 'Arquivos').resolve()
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else (script_dir / 'output').resolve()
-    temp_dir = Path(args.temp_dir).resolve() if args.temp_dir else output_dir / 'temp_csvs'
+    config_path = Path(args.config).resolve() if args.config else None
+    config = load_config(config_path, script_dir)
+    setup_logging(config.get("log_level", "INFO"))
+
+    input_dir = Path(args.input_dir).resolve() if args.input_dir else (script_dir / config["input_dir"]).resolve()
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else (script_dir / config["output_dir"]).resolve()
+    temp_dir = Path(args.temp_dir).resolve() if args.temp_dir else (
+        output_dir / "temp_csvs" if config.get("temp_dir") is None else Path(config["temp_dir"]).resolve()
+    )
 
     if args.input_dir is None:
-        print(f'Nenhum --input-dir informado; usando padrão: {input_dir}')
+        logger.info('Nenhum --input-dir informado; usando padrão: %s', input_dir)
     if args.output_dir is None:
-        print(f'Nenhum --output-dir informado; usando padrão: {output_dir}')
+        logger.info('Nenhum --output-dir informado; usando padrão: %s', output_dir)
 
     ensure_dependencies()
 
     ods_files, csv_files = find_files(input_dir)
-    print(f'Encontrado {len(ods_files)} .ods e {len(csv_files)} .csv em {input_dir}')
+    logger.info('Encontrado %s .ods e %s .csv em %s', len(ods_files), len(csv_files), input_dir)
 
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Converte ODS para CSV temporários
     for ods in ods_files:
         created = ods_to_csv(ods, temp_dir)
-        print(f'Convertido {ods} -> {len(created)} CSV(s)')
+        logger.info('Convertido %s -> %s CSV(s)', ods, len(created))
 
     # 2) Coleta todos os CSVs (temporários + já existentes)
     all_csvs = list(temp_dir.rglob('*.csv')) + csv_files
-    print(f'Total CSVs para concatenar: {len(all_csvs)}')
+    logger.info('Total CSVs para concatenar: %s', len(all_csvs))
 
     # 3) Concatena todos os CSVs em um único DataFrame
     big = concat_csvs(all_csvs, output_dir / 'merged.csv')
     if isinstance(big, Path):
-        print('Nenhum CSV válido para concatenar; saindo')
+        logger.warning('Nenhum CSV válido para concatenar; saindo')
         return
+
+    validate_schema(big, config.get("required_columns", {}), "CSV concatenado")
 
     # 4) Remove duplicados
     deduped = remove_duplicates(big)
@@ -700,9 +784,9 @@ def main():
     deduped, other_file = split_by_tipo_alta(deduped, output_dir)
 
     # 6) Remove colunas não desejadas do CSV principal
-    cols_to_drop = [col for col in ['Tipo de Alta', 'Telefone', 'Dia Alta'] if col in deduped.columns]
+    cols_to_drop = [col for col in ['Tipo de Alta', 'Telefone'] if col in deduped.columns]
     if cols_to_drop:
-        print(f'Removendo colunas do CSV principal: {", ".join(cols_to_drop)}')
+        logger.info('Removendo colunas do CSV principal: %s', ", ".join(cols_to_drop))
         deduped = deduped.drop(columns=cols_to_drop)
 
     # 7) Limpeza final: remove linhas vazias ou apenas com vírgulas/aspas
@@ -735,8 +819,18 @@ def main():
             duplicated = keys.duplicated(keep='first')
             drop_idx = idx_with_addr[duplicated]
             if len(drop_idx) > 0:
-                print(f'Removendo duplicatas finais por Pacientes+Endereço: {len(drop_idx)} linhas')
+                logger.info('Removendo duplicatas finais por Pacientes+Endereço: %s linhas', len(drop_idx))
                 deduped = deduped.drop(index=drop_idx)
+
+    # Normaliza datas e ordena por data crescente antes de salvar
+    date_col = find_column(deduped, ['dia alta', 'data'])
+    if date_col:
+        parsed_dates = pd.to_datetime(deduped[date_col], errors='coerce', dayfirst=True)
+        deduped[date_col] = parsed_dates.dt.strftime('%Y-%m-%d')
+        deduped['_SORT_DATE'] = parsed_dates
+        deduped = deduped.sort_values(by='_SORT_DATE', na_position='last')
+        deduped = deduped.drop(columns=['_SORT_DATE'])
+        logger.info('Datas normalizadas em %s e ordenação aplicada.', date_col)
 
     # Reorganiza o índice antes de salvar
     deduped = deduped.reset_index(drop=True)
@@ -762,14 +856,16 @@ def main():
         # ws.column_dimensions['A'].width = 40   # "Pacientes" mais larga
         # ws.row_dimensions[1].height = 18      # cabeçalho mais alto
 
-    print(f'Arquivo principal escrito em: {merged_out}')
+    logger.info('Arquivo principal escrito em: %s', merged_out)
     if other_file is not None:
-        print(f'CSV com tipos de alta não "Melhorado/Melhorada": {other_file}')
+        logger.info('CSV com tipos de alta não "Melhorado/Melhorada": %s', other_file)
+
+    generate_charts(deduped, output_dir)
 
 def generate_patient_count_report(clean_dir: Path, report_file: Path):
     """Gera relatório com quantidade de pacientes por arquivo CAPS."""
     if not clean_dir.exists():
-        print(f'Pasta {clean_dir} não encontrada')
+        logger.warning('Pasta %s não encontrada', clean_dir)
         return
     
     # Collect data for all files
@@ -793,7 +889,7 @@ def generate_patient_count_report(clean_dir: Path, report_file: Path):
             total_patients += patient_count
             
         except Exception as e:
-            print(f'Erro processando {csv_file}: {e}')
+            logger.warning('Erro processando %s: %s', csv_file, e)
     
     # Sort by patient count (descending)
     caps_data.sort(key=lambda x: x['count'], reverse=True)
@@ -827,9 +923,126 @@ def generate_patient_count_report(clean_dir: Path, report_file: Path):
         f.write("Arquivos localizados em: by_encaminhado_clean/\n")
         f.write("=" * 60 + "\n")
     
-    print(f'Relatório de pacientes criado: {report_file}')
-    print(f'Total de pacientes: {total_patients}')
-    print(f'Distribuídos em {len(caps_data)} CAPS')
+    logger.info('Relatório de pacientes criado: %s', report_file)
+    logger.info('Total de pacientes: %s', total_patients)
+    logger.info('Distribuídos em %s CAPS', len(caps_data))
+
+
+def generate_charts(df, output_dir: Path) -> None:
+    """Gera gráficos PNG com estatísticas básicas do dataset consolidado."""
+    def annotate_bar_values(ax) -> None:
+        if hasattr(ax, "bar_label"):
+            for container in ax.containers:
+                ax.bar_label(container, fmt="%d", padding=2)
+        else:
+            for patch in ax.patches:
+                height = patch.get_height()
+                if height is None:
+                    continue
+                ax.annotate(
+                    f"{int(height)}",
+                    (patch.get_x() + patch.get_width() / 2, height),
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    xytext=(0, 2),
+                    textcoords="offset points",
+                )
+
+    if df is None or df.empty:
+        logger.info('Sem dados para gerar gráficos.')
+        return
+
+    charts_dir = output_dir / 'graficos'
+    charts_dir.mkdir(parents=True, exist_ok=True)
+
+    date_col = find_column(df, ['dia alta', 'data'])
+    if date_col:
+        series = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
+        month_counts = (
+            series.dropna()
+            .dt.to_period('M')
+            .astype(str)
+            .value_counts()
+            .sort_index()
+        )
+        if not month_counts.empty:
+            plt.figure(figsize=(10, 4))
+            ax = month_counts.plot(kind='bar')
+            plt.title('Altas por mês')
+            plt.xlabel('Mês')
+            plt.ylabel('Quantidade')
+            annotate_bar_values(ax)
+            plt.tight_layout()
+            out_file = charts_dir / 'altas_por_mes.png'
+            plt.savefig(out_file, dpi=150)
+            plt.close()
+            logger.info('Gráfico gerado: %s', out_file)
+    else:
+        logger.info('Coluna de data não encontrada; gráfico "Altas por mês" não gerado.')
+
+    enc_col = find_column(df, ['encaminhado', 'encaminhamento'])
+    if enc_col:
+        caps = (
+            df[enc_col]
+            .fillna('')
+            .astype(str)
+            .str.strip()
+            .replace('', 'VAZIO')
+        )
+        caps_counts = caps.value_counts().sort_values(ascending=False)
+        if not caps_counts.empty:
+            plt.figure(figsize=(10, 5))
+            ax = caps_counts.plot(kind='bar')
+            plt.title('Altas por CAPS')
+            plt.xlabel('CAPS')
+            plt.ylabel('Quantidade')
+            plt.xticks(rotation=45, ha='right')
+            annotate_bar_values(ax)
+            plt.tight_layout()
+            out_file = charts_dir / 'altas_por_caps.png'
+            plt.savefig(out_file, dpi=150)
+            plt.close()
+            logger.info('Gráfico gerado: %s', out_file)
+    else:
+        logger.info('Coluna "Encaminhado" não encontrada; gráfico "Altas por CAPS" não gerado.')
+
+    if date_col and enc_col:
+        series = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
+        months = series.dt.to_period('M').astype(str)
+        caps = (
+            df[enc_col]
+            .fillna('')
+            .astype(str)
+            .str.strip()
+            .replace('', 'VAZIO')
+        )
+
+        pivot = pd.crosstab(months, caps)
+        if not pivot.empty:
+            top_caps = pivot.sum(axis=0).sort_values(ascending=False).head(12).index
+            pivot = pivot[top_caps]
+
+            plt.figure(figsize=(10, 6))
+            data = pivot.T.values
+            plt.imshow(data, aspect='auto', cmap='magma')
+            plt.title('Altas por Mês x CAPS (Top 12)')
+            plt.xlabel('Mês')
+            plt.ylabel('CAPS')
+            plt.xticks(range(len(pivot.index)), pivot.index, rotation=45, ha='right')
+            plt.yticks(range(len(pivot.columns)), pivot.columns)
+            plt.colorbar(label='Quantidade')
+            max_val = data.max() if data.size > 0 else 0
+            for y in range(data.shape[0]):
+                for x in range(data.shape[1]):
+                    val = int(data[y, x])
+                    color = 'white' if max_val and val >= max_val * 0.5 else 'black'
+                    plt.text(x, y, str(val), ha='center', va='center', fontsize=7, color=color)
+            plt.tight_layout()
+            out_file = charts_dir / 'altas_mes_x_caps.png'
+            plt.savefig(out_file, dpi=150)
+            plt.close()
+            logger.info('Gráfico gerado: %s', out_file)
 
 
 def create_clean_encaminhado_files(source_dir: Path, dest_dir: Path):
@@ -843,40 +1056,21 @@ def create_clean_encaminhado_files(source_dir: Path, dest_dir: Path):
     
     for csv_file in source_dir.glob('*.csv'):
         try:
-            # Read the CSV file
             df = pd.read_csv(csv_file, dtype=str)
-            
-            # Remove problematic rows
-            # 1. Remove rows where all columns except the first are empty or just commas
-            mask_valid = True
-            for col in df.columns[1:]:  # Skip first column (Pacientes)
-                mask_valid = mask_valid & (df[col].fillna('').str.strip() != '')
-            
-            # 2. Remove rows where Pacientes is empty
-            mask_valid = mask_valid & (df['Pacientes'].fillna('').str.strip() != '')
-            
-            # 3. Remove rows that are just quotes and commas
-            mask_valid = mask_valid & ~(df['Pacientes'].fillna('').str.strip().isin(['', '""']))
-            
-            # Apply the mask to keep only valid rows
-            df_clean = df[mask_valid].copy()
-            
-            # Additional cleanup: remove rows where only name exists but no other data
-            has_data_mask = False
-            for col in ['Tipo de Alta', 'Telefone', 'Dia Alta', 'Cid', 'Endereço']:
-                if col in df_clean.columns:
-                    has_data_mask = has_data_mask | (df_clean[col].fillna('').str.strip() != '')
-            
-            df_clean = df_clean[has_data_mask].copy()
-            
-            # Save clean file
+            df_clean = clean_dataframe(df)
+
             dest_file = dest_dir / csv_file.name
             df_clean.to_csv(dest_file, index=False)
             
-            print(f'Arquivo limpo criado: {csv_file.name} ({len(df)} -> {len(df_clean)} linhas)')
+            logger.info(
+                'Arquivo limpo criado: %s (%s -> %s linhas)',
+                csv_file.name,
+                len(df),
+                len(df_clean),
+            )
             
         except Exception as e:
-            print(f'Erro processando {csv_file}: {e}')
+            logger.error('Erro processando %s: %s', csv_file, e)
             # Copy original file if cleaning fails
             shutil.copy2(csv_file, dest_dir / csv_file.name)
 

@@ -3,3 +3,4 @@ ezodf>=0.3.2
 openpyxl
 lxml>=4.6.0
 xlwt>=1.3.0
+matplotlib
