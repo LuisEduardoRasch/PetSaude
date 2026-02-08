@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import unicodedata
 from pathlib import Path
@@ -621,7 +622,7 @@ def split_by_tipo_alta(df, output_dir: Path):
     main_df = df[~mask_other].copy()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    other_file = output_dir / 'altas_nao_melhorado.xlsx'
+    other_file = output_dir / 'Sem Melhora.xlsx'
 
     # Grava arquivo de altas não "Melhorado/Melhorada" com ajuste básico de colunas
     with pd.ExcelWriter(other_file, engine='openpyxl') as writer:
@@ -837,7 +838,7 @@ def main():
 
     # Grava arquivo principal final em formato Excel (.xlsx) com ajuste básico de colunas
     output_dir.mkdir(parents=True, exist_ok=True)
-    merged_out = output_dir / 'merged_principal.xlsx'
+    merged_out = output_dir / 'Altas.xlsx'
 
     with pd.ExcelWriter(merged_out, engine='openpyxl') as writer:
         deduped.to_excel(writer, index=False, sheet_name='Altas')
@@ -861,6 +862,10 @@ def main():
         logger.info('CSV com tipos de alta não "Melhorado/Melhorada": %s', other_file)
 
     generate_charts(deduped, output_dir)
+
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.info('Pasta temporária removida: %s', temp_dir)
 
 def generate_patient_count_report(clean_dir: Path, report_file: Path):
     """Gera relatório com quantidade de pacientes por arquivo CAPS."""
@@ -1025,8 +1030,8 @@ def generate_charts(df, output_dir: Path) -> None:
 
             plt.figure(figsize=(10, 6))
             data = pivot.T.values
-            plt.imshow(data, aspect='auto', cmap='magma')
-            plt.title('Altas por Mês x CAPS (Top 12)')
+            plt.imshow(data, aspect='auto', cmap='viridis')
+            plt.title('Altas por Mês x CAPS')
             plt.xlabel('Mês')
             plt.ylabel('CAPS')
             plt.xticks(range(len(pivot.index)), pivot.index, rotation=45, ha='right')
@@ -1036,7 +1041,7 @@ def generate_charts(df, output_dir: Path) -> None:
             for y in range(data.shape[0]):
                 for x in range(data.shape[1]):
                     val = int(data[y, x])
-                    color = 'white' if max_val and val >= max_val * 0.5 else 'black'
+                    color = 'black' if max_val and val >= max_val * 0.5 else 'white'
                     plt.text(x, y, str(val), ha='center', va='center', fontsize=7, color=color)
             plt.tight_layout()
             out_file = charts_dir / 'altas_mes_x_caps.png'
